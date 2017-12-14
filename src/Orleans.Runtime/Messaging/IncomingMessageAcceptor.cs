@@ -1,29 +1,23 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
-using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using Orleans.Messaging;
 using Orleans.Serialization;
 
 namespace Orleans.Runtime.Messaging
 {
-    internal class IncomingMessageAcceptor : SingleTaskAsynchAgent
+    internal class IncomingMessageAcceptor : IMessageHandler, ITransportListener
     {
-        private readonly ConcurrentObjectPool<SaeaPoolWrapper> receiveEventArgsPool;
-        private const int SocketBufferSize = 1024 * 128; // 128 kb
+        public ITransport AcceptingTransport;
         private readonly IPEndPoint listenAddress;
         private Action<Message> sniffIncomingMessageHandler;
-        private readonly LingerOption receiveLingerOption = new LingerOption(true, 0);
-        internal Socket AcceptingSocket;
+        protected Logger Log;
+        private object Lockable = new object();
         protected MessageCenter MessageCenter;
-        protected HashSet<Socket> OpenReceiveSockets;
+        protected HashSet<ITransport> OpenReceiveTransports;
         protected readonly MessageFactory MessageFactory;
 
-        private static readonly CounterStatistic allocatedSocketEventArgsCounter 
-            = CounterStatistic.FindOrCreate(StatisticNames.MESSAGE_ACCEPTOR_ALLOCATED_SOCKET_EVENT_ARGS, false);
-        private readonly CounterStatistic checkedOutSocketEventArgsCounter;
-        private readonly CounterStatistic checkedInSocketEventArgsCounter;
         private readonly SerializationManager serializationManager;
         private readonly ILoggerFactory loggerFactory;
         public Action<Message> SniffIncomingMessage
@@ -39,42 +33,29 @@ namespace Orleans.Runtime.Messaging
 
         private const int LISTEN_BACKLOG_SIZE = 1024;
 
-        protected SocketDirection SocketDirection { get; private set; }
-
         // Used for holding enough info to handle receive completion
-        internal IncomingMessageAcceptor(MessageCenter msgCtr, IPEndPoint here, SocketDirection socketDirection, MessageFactory messageFactory, SerializationManager serializationManager,
-            ExecutorService executorService, ILoggerFactory loggerFactory)
-            :base(executorService, loggerFactory)
+        internal IncomingMessageAcceptor(MessageCenter msgCtr, IPEndPoint here, MessageFactory messageFactory, SerializationManager serializationManager,
+            ExecutorService executorService, ILoggerFactory loggerFactory, ITransportFactory transportFactory)
         {
             this.loggerFactory = loggerFactory;
             Log = new LoggerWrapper<IncomingMessageAcceptor>(loggerFactory);
             MessageCenter = msgCtr;
             listenAddress = here;
             this.MessageFactory = messageFactory;
-            this.receiveEventArgsPool = new ConcurrentObjectPool<SaeaPoolWrapper>(() => this.CreateSocketReceiveAsyncEventArgsPoolWrapper());
             this.serializationManager = serializationManager;
             if (here == null)
                 listenAddress = MessageCenter.MyAddress.Endpoint;
 
-            AcceptingSocket = MessageCenter.SocketManager.GetAcceptingSocketForEndpoint(listenAddress);
-            Log.Info(ErrorCode.Messaging_IMA_OpenedListeningSocket, "Opened a listening socket at address " + AcceptingSocket.LocalEndPoint);
-            OpenReceiveSockets = new HashSet<Socket>();
-            OnFault = FaultBehavior.CrashOnFault;
-            SocketDirection = socketDirection;
-
-            checkedOutSocketEventArgsCounter = CounterStatistic.FindOrCreate(StatisticNames.MESSAGE_ACCEPTOR_CHECKED_OUT_SOCKET_EVENT_ARGS, false);
-            checkedInSocketEventArgsCounter = CounterStatistic.FindOrCreate(StatisticNames.MESSAGE_ACCEPTOR_CHECKED_IN_SOCKET_EVENT_ARGS, false);
-
-            IntValueStatistic.FindOrCreate(StatisticNames.MESSAGE_ACCEPTOR_IN_USE_SOCKET_EVENT_ARGS,
-                () => checkedOutSocketEventArgsCounter.GetCurrentValue() - checkedInSocketEventArgsCounter.GetCurrentValue());
+            AcceptingTransport = transportFactory.CreateReceivingTransport(listenAddress);
+            Log.Info(ErrorCode.Messaging_IMA_OpenedListeningSocket, "Opened a listening socket at address " + AcceptingTransport.LocalEndPoint);
+            OpenReceiveTransports = new HashSet<ITransport>();
         }
 
-        protected override void Run()
+        public void Start()
         {
             try
             {
-                AcceptingSocket.Listen(LISTEN_BACKLOG_SIZE);
-                StartAccept(null);
+                AcceptingTransport.ListenAsync(this);
             }
             catch (Exception ex)
             {
@@ -84,57 +65,38 @@ namespace Orleans.Runtime.Messaging
             if (Log.IsVerbose3) Log.Verbose3("Started accepting connections.");
         }
 
-        public override void Stop()
+        public void Stop()
         {
-            base.Stop();
-
             if (Log.IsVerbose) Log.Verbose("Disconnecting the listening socket");
-            SocketManager.CloseSocket(AcceptingSocket);
-
-            Socket[] temp;
-            lock (Lockable)
-            {
-                temp = new Socket[OpenReceiveSockets.Count];
-                OpenReceiveSockets.CopyTo(temp);
-            }
-            foreach (var socket in temp)
-            {
-                SafeCloseSocket(socket);
-            }
-            lock (Lockable)
-            {
-                ClearSockets();
-            }
+            AcceptingTransport.Close();
         }
 
-        protected virtual bool RecordOpenedSocket(Socket sock)
+        protected virtual bool RecordOpenedTransport(ITransport transport)
         {
             GrainId client;
-            if (!ReceiveSocketPreample(sock, false, out client)) return false;
+            if (!ReceiveTransportPreample(transport, false, out client)) return false;
 
             NetworkingStatisticsGroup.OnOpenedReceiveSocket();
             return true;
         }
 
-        protected bool ReceiveSocketPreample(Socket sock, bool expectProxiedConnection, out GrainId client)
+        protected bool ReceiveTransportPreample(ITransport transport, bool expectProxiedConnection, out GrainId client)
         {
             client = null;
 
-            if (Cts.IsCancellationRequested) return false;
-
-            if (!ReadConnectionPreamble(sock, out client))
+            if (!ReadConnectionPreamble(transport, out client))
             {
                 return false;
             }
 
-            if (Log.IsVerbose2) Log.Verbose2(ErrorCode.MessageAcceptor_Connection, "Received connection from {0} at source address {1}", client, sock.RemoteEndPoint.ToString());
+            if (Log.IsVerbose2) Log.Verbose2(ErrorCode.MessageAcceptor_Connection, "Received connection from {0} at source address {1}", client, transport.RemoteEndPoint.ToString());
 
             if (expectProxiedConnection)
             {
                 // Proxied Gateway Connection - must have sender id
                 if (client.Equals(Constants.SiloDirectConnectionId))
                 {
-                    Log.Error(ErrorCode.MessageAcceptor_NotAProxiedConnection, $"Gateway received unexpected non-proxied connection from {client} at source address {sock.RemoteEndPoint}");
+                    Log.Error(ErrorCode.MessageAcceptor_NotAProxiedConnection, $"Gateway received unexpected non-proxied connection from {client} at source address {transport.RemoteEndPoint}");
                     return false;
                 }
             }
@@ -143,32 +105,32 @@ namespace Orleans.Runtime.Messaging
                 // Direct connection - should not have sender id
                 if (!client.Equals(Constants.SiloDirectConnectionId))
                 {
-                    Log.Error(ErrorCode.MessageAcceptor_UnexpectedProxiedConnection, $"Silo received unexpected proxied connection from {client} at source address {sock.RemoteEndPoint}");
+                    Log.Error(ErrorCode.MessageAcceptor_UnexpectedProxiedConnection, $"Silo received unexpected proxied connection from {client} at source address {transport.RemoteEndPoint}");
                     return false;
                 }
             }
 
             lock (Lockable)
             {
-                OpenReceiveSockets.Add(sock);
+                OpenReceiveTransports.Add(transport);
             }
 
             return true;
         }
 
-        private bool ReadConnectionPreamble(Socket socket, out GrainId grainId)
+        private bool ReadConnectionPreamble(ITransport transport, out GrainId grainId)
         {
             grainId = null;
             byte[] buffer = null;
             try
             {
-                buffer = ReadFromSocket(socket, sizeof(int)); // Read the size 
+                buffer = ReadFromTransport(transport, sizeof(int)); // Read the size 
                 if (buffer == null) return false;
                 Int32 size = BitConverter.ToInt32(buffer, 0);
 
                 if (size > 0)
                 {
-                    buffer = ReadFromSocket(socket, size); // Receive the client ID
+                    buffer = ReadFromTransport(transport, size); // Receive the client ID
                     if (buffer == null) return false;
                     grainId = GrainIdExtensions.FromByteArray(buffer);
                 }
@@ -177,12 +139,12 @@ namespace Orleans.Runtime.Messaging
             catch (Exception exc)
             {
                 Log.Error(ErrorCode.GatewayFailedToParse,
-                    $"Failed to convert the data that read from the socket. buffer = {Utils.EnumerableToString(buffer)}, from endpoint {socket.RemoteEndPoint}.", exc);
+                    $"Failed to convert the data that read from the socket. buffer = {Utils.EnumerableToString(buffer)}, from endpoint {transport.RemoteEndPoint}.", exc);
                 return false;
             }
         }
 
-        private byte[] ReadFromSocket(Socket sock, int expected)
+        private byte[] ReadFromTransport(ITransport transport, int expected)
         {
             var buffer = new byte[expected];
             int offset = 0;
@@ -190,11 +152,11 @@ namespace Orleans.Runtime.Messaging
             {
                 try
                 {
-                    int bytesRead = sock.Receive(buffer, offset, buffer.Length - offset, SocketFlags.None);
+                    int bytesRead = transport.Receive(buffer, offset, buffer.Length - offset);
                     if (bytesRead == 0)
                     {
                         Log.Warn(ErrorCode.GatewayAcceptor_SocketClosed,
-                            "Remote socket closed while receiving connection preamble data from endpoint {0}.", sock.RemoteEndPoint);
+                            "Remote socket closed while receiving connection preamble data from endpoint {0}.", transport.RemoteEndPoint);
                         return null;
                     }
                     offset += bytesRead;
@@ -202,295 +164,36 @@ namespace Orleans.Runtime.Messaging
                 catch (Exception ex)
                 {
                     Log.Warn(ErrorCode.GatewayAcceptor_ExceptionReceiving,
-                        "Exception receiving connection preamble data from endpoint " + sock.RemoteEndPoint, ex);
+                        "Exception receiving connection preamble data from endpoint " + transport.RemoteEndPoint, ex);
                     return null;
                 }
             }
             return buffer;
         }
 
-        protected virtual void RecordClosedSocket(Socket sock)
+        protected virtual void RecordClosedTransport(ITransport transport)
         {
-            if (TryRemoveClosedSocket(sock))
+            if (TryRemoveClosedTransport(transport))
                 NetworkingStatisticsGroup.OnClosedReceivingSocket();
         }
 
-        protected bool TryRemoveClosedSocket(Socket sock)
+        protected bool TryRemoveClosedTransport(ITransport transport)
         {
             lock (Lockable)
             {
-                return OpenReceiveSockets.Remove(sock);
+                return OpenReceiveTransports.Remove(transport);
             }
         }
 
-        protected virtual void ClearSockets()
+        protected virtual void ClearTransports()
         {
             lock (Lockable)
             {
-                OpenReceiveSockets.Clear();
+                OpenReceiveTransports.Clear();
             }
         }
 
-        /// <summary>
-        /// Begins an operation to accept a connection request from the client.
-        /// </summary>
-        /// <param name="acceptEventArg">The context object to use when issuing 
-        /// the accept operation on the server's listening socket.</param>
-        private void StartAccept(SocketAsyncEventArgs acceptEventArg)
-        {
-            if (acceptEventArg == null)
-            {
-                acceptEventArg = new SocketAsyncEventArgs();
-                acceptEventArg.UserToken = this;
-                acceptEventArg.Completed += OnAcceptCompleted;
-            }
-            else
-            {
-                // We have handed off the connection info from the
-                // accepting socket to the receiving socket. So, now we will clear 
-                // the socket info from that object, so it will be 
-                // ready for a new socket
-                acceptEventArg.AcceptSocket = null;
-            }
-
-            // Socket.AcceptAsync begins asynchronous operation to accept the connection.
-            // Note the listening socket will pass info to the SocketAsyncEventArgs
-            // object that has the Socket that does the accept operation.
-            // If you do not create a Socket object and put it in the SAEA object
-            // before calling AcceptAsync and use the AcceptSocket property to get it,
-            // then a new Socket object will be created by .NET. 
-            try
-            {
-                // AcceptAsync returns true if the I / O operation is pending.The SocketAsyncEventArgs.Completed event 
-                // on the e parameter will be raised upon completion of the operation.Returns false if the I/O operation 
-                // completed synchronously. The SocketAsyncEventArgs.Completed event on the e parameter will not be raised 
-                // and the e object passed as a parameter may be examined immediately after the method call returns to retrieve 
-                // the result of the operation.
-                while (!AcceptingSocket.AcceptAsync(acceptEventArg))
-                {
-                    ProcessAccept(acceptEventArg, true);
-                }
-            }
-            catch (SocketException ex)
-            {
-                Log.Warn(ErrorCode.MessagingAcceptAsyncSocketException, "Socket error on accepting socket during AcceptAsync {0}", ex.SocketErrorCode);
-                RestartAcceptingSocket();
-            }
-            catch (ObjectDisposedException)
-            {
-                // Socket was closed, but we're not shutting down; we need to open a new socket and start over...
-                // Close the old socket and open a new one
-                Log.Warn(ErrorCode.MessagingAcceptingSocketClosed, "Accepting socket was closed when not shutting down");
-                RestartAcceptingSocket();
-            }
-            catch (Exception ex)
-            {
-                // There was a network error. We need to get a new accepting socket and re-issue an accept before we continue.
-                // Close the old socket and open a new one
-                Log.Warn(ErrorCode.MessagingAcceptAsyncSocketException, "Exception on accepting socket during AcceptAsync", ex);
-                RestartAcceptingSocket();
-            }
-        }
-
-        private void OnAcceptCompleted(object sender, SocketAsyncEventArgs e)
-        {
-            ((IncomingMessageAcceptor)e.UserToken).ProcessAccept(e, false);
-        }
-
-        /// <summary>
-        /// Process the accept for the socket listener.
-        /// </summary>
-        /// <param name="e">SocketAsyncEventArg associated with the completed accept operation.</param>
-        /// <param name="completedSynchronously">Shows whether AcceptAsync completed synchronously, 
-        /// if true - the next accept operation woun't be started. Used for avoiding potential stack overflows.</param>
-        private void ProcessAccept(SocketAsyncEventArgs e, bool completedSynchronously)
-        {
-            var ima = e.UserToken as IncomingMessageAcceptor;
-            try
-            {
-                if (ima == null)
-                {
-                    Log.Warn(ErrorCode.Messaging_IMA_AcceptCallbackUnexpectedState,
-                        "AcceptCallback invoked with an unexpected async state of type {0}",
-                        e.UserToken?.GetType().ToString() ?? "null");
-                    return;
-                }
-
-                if (e.SocketError != SocketError.Success)
-                {
-                    RestartAcceptingSocket();
-                    return;
-                }
-
-                // First check to see if we're shutting down, in which case there's no point in doing anything other
-                // than closing the accepting socket and returning.
-                if (ima.Cts == null || ima.Cts.IsCancellationRequested)
-                {
-                    SocketManager.CloseSocket(ima.AcceptingSocket);
-                    ima.Log.Info(ErrorCode.Messaging_IMA_ClosingSocket, "Closing accepting socket during shutdown");
-                    return;
-                }
-
-                Socket sock = e.AcceptSocket;
-                if (sock.Connected)
-                {
-                    if (ima.Log.IsVerbose) ima.Log.Verbose("Received a connection from {0}", sock.RemoteEndPoint);
-
-                    // Finally, process the incoming request:
-                    // Prep the socket so it will reset on close
-                    sock.LingerState = receiveLingerOption;
-
-                    // Add the socket to the open socket collection
-                    if (ima.RecordOpenedSocket(sock))
-                    {
-                        // Get the socket for the accepted client connection and put it into the 
-                        // ReadEventArg object user token.
-                        var readEventArgs = GetSocketReceiveAsyncEventArgs(sock);
-
-                        StartReceiveAsync(sock, readEventArgs, ima);
-                    }
-                    else
-                    {
-                        ima.SafeCloseSocket(sock);
-                    }
-                }
-
-                // The next accept will be started in the caller method
-                if (completedSynchronously)
-                {
-                    return;
-                }
-
-                // Start a new Accept 
-                StartAccept(e);
-            }
-            catch (Exception ex)
-            {
-                var logger = ima?.Log ?? this.Log;
-                logger.Error(ErrorCode.Messaging_IMA_ExceptionAccepting, "Unexpected exception in IncomingMessageAccepter.AcceptCallback", ex);
-                RestartAcceptingSocket();
-            }
-        }
-
-        private void StartReceiveAsync(Socket sock, SocketAsyncEventArgs readEventArgs, IncomingMessageAcceptor ima)
-        {
-            try
-            {
-                // Set up the async receive
-                if (!sock.ReceiveAsync(readEventArgs))
-                {
-                    ProcessReceive(readEventArgs);
-                }
-            }
-            catch (Exception exception)
-            {
-                var socketException = exception as SocketException;
-                var context = readEventArgs.UserToken as ReceiveCallbackContext;
-                ima.Log.Warn(ErrorCode.Messaging_IMA_NewBeginReceiveException,
-                    $"Exception on new socket during ReceiveAsync with RemoteEndPoint " +
-                    $"{socketException?.SocketErrorCode}: {context?.RemoteEndPoint}", exception);
-                ima.SafeCloseSocket(sock);
-                FreeSocketAsyncEventArgs(readEventArgs);
-            }
-        }
-
-        private SocketAsyncEventArgs GetSocketReceiveAsyncEventArgs(Socket sock)
-        {
-            var saea = receiveEventArgsPool.Allocate();
-            var token = ((ReceiveCallbackContext) saea.SocketAsyncEventArgs.UserToken);
-            token.IMA = this;
-            token.Socket = sock;
-            checkedOutSocketEventArgsCounter.Increment();
-            return saea.SocketAsyncEventArgs;
-        }
-
-        private SaeaPoolWrapper CreateSocketReceiveAsyncEventArgsPoolWrapper()
-        {
-            SocketAsyncEventArgs readEventArgs = new SocketAsyncEventArgs();
-            readEventArgs.Completed += OnReceiveCompleted;
-
-            var buffer = new byte[SocketBufferSize];
-
-            // SocketAsyncEventArgs and ReceiveCallbackContext's buffer shares the same buffer list with pinned arrays.
-            readEventArgs.SetBuffer(buffer, 0, buffer.Length);
-            var poolWrapper = new SaeaPoolWrapper(readEventArgs);
-
-            // Creates with incomplete state: IMA should be set before using
-            readEventArgs.UserToken = new ReceiveCallbackContext(poolWrapper, this.MessageFactory, this.serializationManager, this.loggerFactory);
-            allocatedSocketEventArgsCounter.Increment();
-            return poolWrapper;
-        }
-
-        private void FreeSocketAsyncEventArgs(SocketAsyncEventArgs args)
-        {
-            var receiveToken = (ReceiveCallbackContext) args.UserToken;
-            receiveToken.Reset();
-            args.AcceptSocket = null;
-            checkedInSocketEventArgsCounter.Increment();
-            receiveEventArgsPool.Free(receiveToken.SaeaPoolWrapper);
-        }
-
-        private static void OnReceiveCompleted(object sender, SocketAsyncEventArgs e)
-        {
-            if (e.LastOperation != SocketAsyncOperation.Receive)
-            {
-                throw new ArgumentException("The last operation completed on the socket was not a receive");
-            }
-
-            var rcc = e.UserToken as ReceiveCallbackContext;
-            if (rcc.IMA.Log.IsVerbose3) rcc.IMA.Log.Verbose("Socket receive completed from remote " + e.RemoteEndPoint);
-            rcc.IMA.ProcessReceive(e);
-        }
-
-        /// <summary>
-        /// This method is invoked when an asynchronous receive operation completes. 
-        /// If the remote host closed the connection, then the socket is closed. 
-        /// </summary>
-        /// <param name="e">SocketAsyncEventArg associated with the completed receive operation.</param>
-        private void ProcessReceive(SocketAsyncEventArgs e)
-        {
-            var rcc = e.UserToken as ReceiveCallbackContext;
-
-            // If no data was received, close the connection. This is a normal
-            // situation that shows when the remote host has finished sending data.
-            if (e.BytesTransferred <= 0)
-            {
-                if (Log.IsVerbose) Log.Verbose("Closing recieving socket: " + e.RemoteEndPoint);
-                rcc.IMA.SafeCloseSocket(rcc.Socket);
-                FreeSocketAsyncEventArgs(e);
-                return;
-            }
-
-            if (e.SocketError != SocketError.Success)
-            {
-                Log.Warn(ErrorCode.Messaging_IMA_NewBeginReceiveException,
-                   $"Socket error on new socket during ReceiveAsync with RemoteEndPoint: {e.SocketError}");
-                rcc.IMA.SafeCloseSocket(rcc.Socket);
-                FreeSocketAsyncEventArgs(e);
-                return;
-            }
-
-            Socket sock = rcc.Socket;
-            try
-            {
-                rcc.ProcessReceived(e);
-            }
-            catch (Exception ex)
-            {
-                rcc.IMA.Log.Error(ErrorCode.Messaging_IMA_BadBufferReceived,
-                    $"ProcessReceivedBuffer exception with RemoteEndPoint {rcc.RemoteEndPoint}: ", ex);
-
-                // There was a problem with the buffer, presumably data corruption, so give up
-                rcc.IMA.SafeCloseSocket(rcc.Socket);
-                FreeSocketAsyncEventArgs(e);
-                // And we're done
-                return;
-            }
-
-            StartReceiveAsync(sock, e, rcc.IMA);
-        }
-
-        protected virtual void HandleMessage(Message msg, Socket receivedOnSocket)
+        public virtual void HandleMessage(Message msg)
         {
             // See it's a Ping message, and if so, short-circuit it
             object pingObj;
@@ -578,15 +281,12 @@ namespace Orleans.Runtime.Messaging
             }
         }
 
-        private void RestartAcceptingSocket()
+        private void RestartAcceptingListener()
         {
             try
             {
                 if (Log.IsVerbose) Log.Verbose("Restarting of the accepting socket");
-                SocketManager.CloseSocket(AcceptingSocket);
-                AcceptingSocket = MessageCenter.SocketManager.GetAcceptingSocketForEndpoint(listenAddress);
-                AcceptingSocket.Listen(LISTEN_BACKLOG_SIZE);
-                StartAccept(null);
+                AcceptingTransport.RestartListenAsync(this);
             }
             catch (Exception ex)
             {
@@ -595,38 +295,146 @@ namespace Orleans.Runtime.Messaging
             }
         }
 
-        private void SafeCloseSocket(Socket sock)
+        private void SafeCloseTransport(ITransport transport)
         {
-            RecordClosedSocket(sock);
-            SocketManager.CloseSocket(sock);
+            RecordClosedTransport(transport);
+            transport.Close();
         }
 
-        private class ReceiveCallbackContext
+        public bool OnAccept(ITransport transport, TransportError transportError)
+        {
+            transport.UserToken = this;
+
+            if (transportError != TransportError.Success)
+            {
+                RestartAcceptingListener();
+                return false;
+            }
+
+            return true;
+        }
+
+        public bool OnOpen(ITransport transport, TransportError transportError)
+        {
+            var ima = transport.UserToken as IncomingMessageAcceptor;
+            if (ima == null)
+            {
+                Log.Warn(ErrorCode.Messaging_IMA_AcceptCallbackUnexpectedState,
+                    "AcceptCallback invoked with an unexpected async state of type {0}",
+                    transport.UserToken?.GetType().ToString() ?? "null");
+                transport.Close();
+                return false;
+            }
+
+            if (ima != this)
+            {
+                ima.OnOpen(transport, transportError);
+                return false;
+            }
+
+            if (transportError != TransportError.Success)
+            {
+                transport.Close();
+                RestartAcceptingListener();
+                return false;
+            }
+
+            if (!RecordOpenedTransport(transport))
+            {
+                SafeCloseTransport(transport);
+            }
+
+            var token = new TransportToken(transport, this.MessageFactory, this.serializationManager, this.loggerFactory);
+            token.IMA = ima;
+            transport.UserToken = token;
+
+            return true;
+        }
+
+        public void OnError(Exception exception)
+        {
+            RestartAcceptingListener();
+        }
+
+        public void OnDataReceive(ITransport transport, TransportError transportError, byte[] buffer, int bytesTransferred)
+        {
+            var token = transport.UserToken as TransportToken;
+            if (token.IMA != this)
+            {
+                token.IMA.OnDataReceive(transport, transportError, buffer, bytesTransferred);
+                return;
+            }
+
+            // If no data was received, close the connection. This is a normal
+            // situation that shows when the remote host has finished sending data.
+            if (bytesTransferred <= 0)
+            {
+                if (Log.IsVerbose) Log.Verbose("Closing recieving socket: " + transport.RemoteEndPoint);
+                token.IMA.SafeCloseTransport(transport);
+                return;
+            }
+
+            if (transportError != TransportError.Success)
+            {
+                Log.Warn(ErrorCode.Messaging_IMA_NewBeginReceiveException,
+                   $"Socket error on new socket during ReceiveAsync with RemoteEndPoint: {transportError}");
+                token.IMA.SafeCloseTransport(transport);
+                return;
+            }
+
+            try
+            {
+                token.ProcessReceived(buffer, bytesTransferred);
+            }
+            catch (Exception ex)
+            {
+                token.IMA.Log.Error(ErrorCode.Messaging_IMA_BadBufferReceived,
+                    $"ProcessReceivedBuffer exception with RemoteEndPoint {token.RemoteEndPoint}: ", ex);
+
+                // There was a problem with the buffer, presumably data corruption, so give up
+                token.IMA.SafeCloseTransport(transport);
+                // And we're done
+                return;
+            }
+        }
+
+        public void OnClose(ITransport transport, TransportError transportError)
+        {
+            var token = transport.UserToken as TransportToken;
+            if (token.IMA != this)
+            {
+                token.IMA.OnClose(transport, transportError);
+            }
+
+            Log.Error(-1, "Error occured during socket closing");
+        }
+
+        private class TransportToken
         {
             private readonly MessageFactory messageFactory;
             private readonly IncomingMessageBuffer _buffer;
-            private Socket socket;
+            private ITransport transport;
 
-            public Socket Socket {
-                get { return socket; }
+            public ITransport Transport
+            {
+                get { return transport; }
                 internal set
                 {
-                    socket = value;
-                    RemoteEndPoint = socket.RemoteEndPoint;
+                    transport = value;
+                    RemoteEndPoint = transport.RemoteEndPoint;
                 }
             }
             public EndPoint RemoteEndPoint { get; private set; }
             public IncomingMessageAcceptor IMA { get; internal set; }
-            public SaeaPoolWrapper SaeaPoolWrapper { get; }
 
-            public ReceiveCallbackContext(SaeaPoolWrapper poolWrapper, MessageFactory messageFactory, SerializationManager serializationManager, ILoggerFactory loggerFactory)
+            public TransportToken(ITransport transport, MessageFactory messageFactory, SerializationManager serializationManager, ILoggerFactory loggerFactory)
             {
+                Transport = transport;
                 this.messageFactory = messageFactory;
-                SaeaPoolWrapper = poolWrapper;
                 _buffer = new IncomingMessageBuffer(loggerFactory, serializationManager);
             }
 
-            public void ProcessReceived(SocketAsyncEventArgs e)
+            public void ProcessReceived(byte[] transportBuffer, int bytesReceived)
             {
 #if TRACK_DETAILED_STATS
                 ThreadTrackingStatistic tracker = null;
@@ -647,7 +455,7 @@ namespace Orleans.Runtime.Messaging
 #endif
                 try
                 {
-                    _buffer.UpdateReceivedData(e.Buffer, e.BytesTransferred);
+                    _buffer.UpdateReceivedData(transportBuffer, bytesReceived);
 
                     while (true)
                     {
@@ -655,7 +463,7 @@ namespace Orleans.Runtime.Messaging
                         try
                         {
                             if (!this._buffer.TryDecodeMessage(out msg)) break;
-                            this.IMA.HandleMessage(msg, this.Socket);
+                            this.IMA.HandleMessage(msg);
                         }
                         catch (Exception exception)
                         {
@@ -672,7 +480,7 @@ namespace Orleans.Runtime.Messaging
                             var response = this.messageFactory.CreateResponseMessage(msg);
                             response.Result = Message.ResponseTypes.Error;
                             response.BodyObject = Response.ExceptionResponse(exception);
-                            
+
                             // Send the error response and continue processing the next message.
                             this.IMA.MessageCenter.SendMessage(response);
                         }
@@ -684,7 +492,7 @@ namespace Orleans.Runtime.Messaging
                     {
                         // Log details of receive state machine
                         IMA.Log.Error(ErrorCode.MessagingProcessReceiveBufferException,
-                            $"Exception trying to process {e.BytesTransferred} bytes from endpoint {RemoteEndPoint}",
+                            $"Exception trying to process {bytesReceived} bytes from endpoint {RemoteEndPoint}",
                             exc);
                     }
                     catch (Exception) { }
@@ -707,16 +515,6 @@ namespace Orleans.Runtime.Messaging
             public void Reset()
             {
                 _buffer.Reset();
-            }
-        }
-
-        private class SaeaPoolWrapper : PooledResource<SaeaPoolWrapper>
-        {
-            public SocketAsyncEventArgs SocketAsyncEventArgs { get; }
-
-            public SaeaPoolWrapper(SocketAsyncEventArgs socketAsyncEventArgs)
-            {
-                SocketAsyncEventArgs = socketAsyncEventArgs;
             }
         }
     }

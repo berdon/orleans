@@ -25,7 +25,7 @@ namespace Orleans.Runtime.Messaging
 
         internal IOutboundMessageQueue OutboundQueue { get; set; }
         internal IInboundMessageQueue InboundQueue { get; set; }
-        internal SocketManager SocketManager;
+        internal TransportManager TransportManager;
         private readonly SerializationManager serializationManager;
         private readonly MessageFactory messageFactory;
         private readonly ILoggerFactory loggerFactory;
@@ -54,6 +54,7 @@ namespace Orleans.Runtime.Messaging
             MessageFactory messageFactory,
             Factory<MessageCenter, Gateway> gatewayFactory,
             ExecutorService executorService,
+            ITransportFactory transportFactory,
             ILoggerFactory loggerFactory)
         {
             this.loggerFactory = loggerFactory;
@@ -61,20 +62,20 @@ namespace Orleans.Runtime.Messaging
             this.serializationManager = serializationManager;
             this.messageFactory = messageFactory;
             this.executorService = executorService;
-            this.Initialize(siloDetails.SiloAddress.Endpoint, nodeConfig.Generation, messagingOptions, networkingOptions, metrics);
+            this.Initialize(siloDetails.SiloAddress.Endpoint, nodeConfig.Generation, messagingOptions, networkingOptions, transportFactory, metrics);
             if (nodeConfig.IsGatewayNode)
             {
                 Gateway = gatewayFactory(this);
             }
         }
 
-        private void Initialize(IPEndPoint here, int generation, IOptions<SiloMessagingOptions> messagingOptions, IOptions<NetworkingOptions> networkingOptions, ISiloPerformanceMetrics metrics = null)
+        private void Initialize(IPEndPoint here, int generation, IOptions<SiloMessagingOptions> messagingOptions, IOptions<NetworkingOptions> networkingOptions, ITransportFactory transportFactory, ISiloPerformanceMetrics metrics = null)
         {
             if(log.IsVerbose3) log.Verbose3("Starting initialization.");
 
-            SocketManager = new SocketManager(networkingOptions, this.loggerFactory);
-            ima = new IncomingMessageAcceptor(this, here, SocketDirection.SiloToSilo, this.messageFactory, this.serializationManager, this.executorService, this.loggerFactory);
-            MyAddress = SiloAddress.New((IPEndPoint)ima.AcceptingSocket.LocalEndPoint, generation);
+            TransportManager = new TransportManager(networkingOptions, transportFactory, loggerFactory);
+            ima = new IncomingMessageAcceptor(this, here ?? this.MyAddress.Endpoint, TransportDirection.SiloToSilo, this.messageFactory, this.serializationManager, this.executorService, this.loggerFactory, transportFactory);
+            MyAddress = SiloAddress.New((IPEndPoint)ima.AcceptingTransport.LocalEndPoint, generation);
             InboundQueue = new InboundMessageQueue(this.loggerFactory);
             OutboundQueue = new OutboundMessageQueue(this, messagingOptions, this.serializationManager, this.executorService, this.loggerFactory);
             Metrics = metrics;
@@ -128,7 +129,7 @@ namespace Orleans.Runtime.Messaging
 
             try
             {
-                SocketManager.Stop();
+                TransportManager.Stop();
             }
             catch (Exception exc)
             {
@@ -209,12 +210,6 @@ namespace Orleans.Runtime.Messaging
 
         public void Dispose()
         {
-            if (ima != null)
-            {
-                ima.Dispose();
-                ima = null;
-            }
-
             OutboundQueue.Dispose();
 
             GC.SuppressFinalize(this);

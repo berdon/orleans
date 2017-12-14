@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using Orleans.Runtime;
 using Orleans.Serialization;
@@ -15,7 +14,7 @@ namespace Orleans.Messaging
     {
         private readonly GatewayConnection gatewayConnection;
         private readonly IncomingMessageBuffer buffer;
-        private Socket socket;
+        private ITransport transport;
 
         internal GatewayClientReceiver(GatewayConnection gateway, SerializationManager serializationManager, ExecutorService executorService, ILoggerFactory loggerFactory)
             : base(gateway.Address.ToString(), executorService, loggerFactory)
@@ -60,18 +59,18 @@ namespace Orleans.Messaging
         {
             try
             {
-                if (gatewayConnection.Socket == null || !gatewayConnection.Socket.Connected)
+                if (gatewayConnection.Transport == null || !gatewayConnection.Transport.Connected)
                 {
                     gatewayConnection.Connect();
                 }
-                if(!Equals(socket, gatewayConnection.Socket))
+                if(!Equals(transport, gatewayConnection.Transport))
                 {
                     buffer.Reset();
-                    socket = gatewayConnection.Socket;
+                    transport = gatewayConnection.Transport;
                 }
-                if (socket != null && socket.Connected)
+                if (transport != null && transport.Connected)
                 {
-                    var bytesRead = socket.Receive(bufferSegments);
+                    var bytesRead = transport.Receive(bufferSegments);
                     if (bytesRead == 0)
                     {
                         throw new EndOfStreamException("Socket closed");
@@ -86,8 +85,8 @@ namespace Orleans.Messaging
                 if (Cts.IsCancellationRequested) return 0;
 
                 Log.Warn(ErrorCode.Runtime_Error_100158, String.Format("Exception receiving from gateway {0}: {1}", gatewayConnection.Address, ex.Message));
-                gatewayConnection.MarkAsDisconnected(socket);
-                socket = null;
+                gatewayConnection.MarkAsDisconnected(transport);
+                transport = null;
                 return 0;
             }
             return 0;

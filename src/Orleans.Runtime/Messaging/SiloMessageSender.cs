@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Net.Sockets;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using Orleans.Messaging;
@@ -26,9 +25,9 @@ namespace Orleans.Runtime.Messaging
             OnFault = FaultBehavior.RestartOnFault;
         }
 
-        protected override SocketDirection GetSocketDirection()
+        protected override TransportDirection GetTransportDirection()
         {
-            return SocketDirection.SiloToSilo;
+            return TransportDirection.SiloToSilo;
         }
 
         protected override bool PrepareMessageForSend(Message msg)
@@ -75,31 +74,31 @@ namespace Orleans.Runtime.Messaging
             return true;
         }
 
-        protected override bool GetSendingSocket(Message msg, out Socket socket, out SiloAddress targetSilo, out string error)
+        protected override bool GetSendingTransport(Message msg, out ITransport transport, out SiloAddress targetSilo, out string error)
         {
-            socket = null;
+            transport = null;
             targetSilo = msg.TargetSilo;
             error = null;
             try
             {
-                socket = messageCenter.SocketManager.GetSendingSocket(targetSilo.Endpoint);
-                if (socket.Connected) return true;
+                transport = messageCenter.TransportManager.GetSendingTransport(targetSilo.Endpoint);
+                if (transport.Connected) return true;
 
-                messageCenter.SocketManager.InvalidateEntry(targetSilo.Endpoint);
-                socket = messageCenter.SocketManager.GetSendingSocket(targetSilo.Endpoint);
+                messageCenter.TransportManager.InvalidateEntry(targetSilo.Endpoint);
+                transport = messageCenter.TransportManager.GetSendingTransport(targetSilo.Endpoint);
                 return true;
             }
             catch (Exception ex)
             {
                 error = "Exception getting a sending socket to endpoint " + targetSilo.ToString();
                 Log.Warn(ErrorCode.Messaging_UnableToGetSendingSocket, error, ex);
-                messageCenter.SocketManager.InvalidateEntry(targetSilo.Endpoint);
+                messageCenter.TransportManager.InvalidateEntry(targetSilo.Endpoint);
                 lastConnectionFailure[targetSilo] = DateTime.UtcNow;
                 return false;
             }
         }
 
-        protected override void OnGetSendingSocketFailure(Message msg, string error)
+        protected override void OnGetSendingTransportFailure(Message msg, string error)
         {
             FailMessage(msg, error);
         }
@@ -131,9 +130,9 @@ namespace Orleans.Runtime.Messaging
             }
         }
 
-        protected override void OnSendFailure(Socket socket, SiloAddress targetSilo)
+        protected override void OnSendFailure(ITransport transport, SiloAddress targetSilo)
         {
-            messageCenter.SocketManager.InvalidateEntry(targetSilo.Endpoint);
+            messageCenter.TransportManager.InvalidateEntry(targetSilo.Endpoint);
         }
 
         protected override void ProcessMessageAfterSend(Message msg, bool sendError, string sendErrorStr)

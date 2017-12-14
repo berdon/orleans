@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using Orleans.Runtime;
 using Orleans.Runtime.Configuration;
@@ -10,7 +9,7 @@ using Orleans.Serialization;
 
 namespace Orleans.Messaging
 {
-    internal enum SocketDirection
+    internal enum TransportDirection
     {
         SiloToSilo,
         ClientToGateway,
@@ -34,13 +33,13 @@ namespace Orleans.Messaging
             bool continueSend = PrepareMessageForSend(msg);
             if (!continueSend) return;
 
-            Socket sock;
+            ITransport transport;
             string error;
             SiloAddress targetSilo;
-            continueSend = GetSendingSocket(msg, out sock, out targetSilo, out error);
+            continueSend = GetSendingTransport(msg, out transport, out targetSilo, out error);
             if (!continueSend)
             {
-                OnGetSendingSocketFailure(msg, error);
+                OnGetSendingTransportFailure(msg, error);
                 return;
             }
 
@@ -70,7 +69,7 @@ namespace Orleans.Messaging
             string sendErrorStr = null;
             try
             {
-                bytesSent = sock.Send(data);
+                bytesSent = transport.Send(data);
                 if (bytesSent != length)
                 {
                     // The complete message wasn't sent, even though no error was reported; treat this as an error
@@ -88,20 +87,20 @@ namespace Orleans.Messaging
                     Log.Warn(ErrorCode.Messaging_ExceptionSending, sendErrorStr, exc);
                 }
             }
-            MessagingStatisticsGroup.OnMessageSend(targetSilo, msg.Direction, bytesSent, headerLength, GetSocketDirection());
+            MessagingStatisticsGroup.OnMessageSend(targetSilo, msg.Direction, bytesSent, headerLength, GetTransportDirection());
             bool sendError = exceptionSending || countMismatchSending;
             if (sendError)
-                OnSendFailure(sock, targetSilo);
+                OnSendFailure(transport, targetSilo);
 
             ProcessMessageAfterSend(msg, sendError, sendErrorStr);
         }
 
-        protected abstract SocketDirection GetSocketDirection();
+        protected abstract TransportDirection GetTransportDirection();
         protected abstract bool PrepareMessageForSend(Message msg);
-        protected abstract bool GetSendingSocket(Message msg, out Socket socket, out SiloAddress targetSilo, out string error);
-        protected abstract void OnGetSendingSocketFailure(Message msg, string error);
+        protected abstract bool GetSendingTransport(Message msg, out ITransport transport, out SiloAddress targetSilo, out string error);
+        protected abstract void OnGetSendingTransportFailure(Message msg, string error);
         protected abstract void OnMessageSerializationFailure(Message msg, Exception exc);
-        protected abstract void OnSendFailure(Socket socket, SiloAddress targetSilo);
+        protected abstract void OnSendFailure(ITransport transport, SiloAddress targetSilo);
         protected abstract void ProcessMessageAfterSend(Message msg, bool sendError, string sendErrorStr);
         protected abstract void FailMessage(Message msg, string reason);
     }

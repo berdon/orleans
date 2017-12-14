@@ -3,7 +3,6 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
-using System.Net.Sockets;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using Orleans.Messaging;
@@ -27,7 +26,7 @@ namespace Orleans.Runtime.Messaging
         // In addition, we use clientSockets collection for fast retrival of ClientState. 
         // Anything that appears in those 2 collections should also appear in the main clients collection.
         private readonly ConcurrentDictionary<GrainId, ClientState> clients;
-        private readonly ConcurrentDictionary<Socket, ClientState> clientSockets;
+        private readonly ConcurrentDictionary<ITransport, ClientState> clientTransports;
         private readonly SiloAddress gatewayAddress;
         private int nextGatewaySenderToUseForRoundRobin;
         private readonly ClientsReplyRoutingCache clientsReplyRoutingCache;
@@ -40,7 +39,7 @@ namespace Orleans.Runtime.Messaging
         private readonly ILoggerFactory loggerFactory;
         private readonly SiloMessagingOptions messagingOptions;
         
-        public Gateway(MessageCenter msgCtr, NodeConfiguration nodeConfig, MessageFactory messageFactory, SerializationManager serializationManager, ExecutorService executorService, ILoggerFactory loggerFactory, IOptions<SiloMessagingOptions> options, IOptions<SiloOptions> siloOptions, IOptions<MultiClusterOptions> multiClusterOptions)
+        public Gateway(MessageCenter msgCtr, NodeConfiguration nodeConfig, MessageFactory messageFactory, SerializationManager serializationManager, ExecutorService executorService, ILoggerFactory loggerFactory, IOptions<SiloMessagingOptions> options, IOptions<SiloOptions> siloOptions, IOptions<MultiClusterOptions> multiClusterOptions, ITransportFactory transportFactory)
         {
             this.messagingOptions = options.Value;
             this.loggerFactory = loggerFactory;
@@ -49,12 +48,12 @@ namespace Orleans.Runtime.Messaging
             this.logger = new LoggerWrapper<Gateway>(this.loggerFactory);
             this.serializationManager = serializationManager;
             this.executorService = executorService;
-            acceptor = new GatewayAcceptor(msgCtr,this, nodeConfig.ProxyGatewayEndpoint, this.messageFactory, this.serializationManager, executorService, siloOptions, multiClusterOptions, loggerFactory);
+            acceptor = new GatewayAcceptor(msgCtr,this, nodeConfig.ProxyGatewayEndpoint, this.messageFactory, this.serializationManager, executorService, siloOptions, multiClusterOptions, loggerFactory, transportFactory);
             senders = new Lazy<GatewaySender>[messagingOptions.GatewaySenderQueues];
             nextGatewaySenderToUseForRoundRobin = 0;
             dropper = new GatewayClientCleanupAgent(this, executorService, loggerFactory, messagingOptions.ClientDropTimeout);
             clients = new ConcurrentDictionary<GrainId, ClientState>();
-            clientSockets = new ConcurrentDictionary<Socket, ClientState>();
+            clientTransports = new ConcurrentDictionary<ITransport, ClientState>();
             clientsReplyRoutingCache = new ClientsReplyRoutingCache(messagingOptions.ResponseTimeout);
             this.gatewayAddress = SiloAddress.New(nodeConfig.ProxyGatewayEndpoint, 0);
             lockable = new object();
@@ -94,20 +93,20 @@ namespace Orleans.Runtime.Messaging
             return clients.Keys;
         }
 
-        internal void RecordOpenedSocket(Socket sock, GrainId clientId)
+        internal void RecordOpenedTransport(ITransport transport, GrainId clientId)
         {
             lock (lockable)
             {
-                logger.Info(ErrorCode.GatewayClientOpenedSocket, "Recorded opened socket from endpoint {0}, client ID {1}.", sock.RemoteEndPoint, clientId);
+                logger.Info(ErrorCode.GatewayClientOpenedSocket, "Recorded opened socket from endpoint {0}, client ID {1}.", transport.RemoteEndPoint, clientId);
                 ClientState clientState;
                 if (clients.TryGetValue(clientId, out clientState))
                 {
-                    var oldSocket = clientState.Socket;
-                    if (oldSocket != null)
+                    var oldTransport = clientState.Transport;
+                    if (oldTransport != null)
                     {
                         // The old socket will be closed by itself later.
                         ClientState ignore;
-                        clientSockets.TryRemove(oldSocket, out ignore);
+                        clientTransports.TryRemove(oldTransport, out ignore);
                     }
                     QueueRequest(clientState, null);
                 }
@@ -119,31 +118,31 @@ namespace Orleans.Runtime.Messaging
                     clients[clientId] = clientState;
                     MessagingStatisticsGroup.ConnectedClientCount.Increment();
                 }
-                clientState.RecordConnection(sock);
-                clientSockets[sock] = clientState;
+                clientState.RecordConnection(transport);
+                clientTransports[transport] = clientState;
                 clientRegistrar.ClientAdded(clientId);
                 NetworkingStatisticsGroup.OnOpenedGatewayDuplexSocket();
             }
         }
 
-        internal void RecordClosedSocket(Socket sock)
+        internal void RecordClosedTransport(ITransport transport)
         {
-            if (sock == null) return;
+            if (transport == null) return;
             lock (lockable)
             {
                 ClientState cs = null;
-                if (!clientSockets.TryGetValue(sock, out cs)) return;
+                if (!clientTransports.TryGetValue(transport, out cs)) return;
 
                 EndPoint endPoint = null;
                 try
                 {
-                    endPoint = sock.RemoteEndPoint;
+                    endPoint = transport.RemoteEndPoint;
                 }
                 catch (Exception) { } // guard against ObjectDisposedExceptions
                 logger.Info(ErrorCode.GatewayClientClosedSocket, "Recorded closed socket from endpoint {0}, client ID {1}.", endPoint != null ? endPoint.ToString() : "null", cs.Id);
 
                 ClientState ignore;
-                clientSockets.TryRemove(sock, out ignore);
+                clientTransports.TryRemove(transport, out ignore);
                 cs.RecordDisconnection();
             }
         }
@@ -189,13 +188,13 @@ namespace Orleans.Runtime.Messaging
             clients.TryRemove(client.Id, out ignore);
             clientRegistrar.ClientDropped(client.Id);
 
-            Socket oldSocket = client.Socket;
-            if (oldSocket != null)
+            ITransport oldTransport = client.Transport;
+            if (oldTransport != null)
             {
                 // this will not happen, since we drop only already disconnected clients, for socket is already null. But leave this code just to be sure.
                 client.RecordDisconnection();
-                clientSockets.TryRemove(oldSocket, out ignore);
-                SocketManager.CloseSocket(oldSocket);
+                clientTransports.TryRemove(oldTransport, out ignore);
+                oldTransport.Close();
             }
             
             MessagingStatisticsGroup.ConnectedClientCount.DecrementBy(1);
@@ -247,12 +246,12 @@ namespace Orleans.Runtime.Messaging
             private readonly TimeSpan clientDropTimeout;
             internal Queue<Message> PendingToSend { get; private set; }
             internal Queue<List<Message>> PendingBatchesToSend { get; private set; }
-            internal Socket Socket { get; private set; }
+            internal ITransport Transport { get; private set; }
             internal DateTime DisconnectedSince { get; private set; }
             internal GrainId Id { get; private set; }
             internal int GatewaySenderNumber { get; private set; }
 
-            internal bool IsConnected { get { return Socket != null; } }
+            internal bool IsConnected { get { return Transport != null; } }
 
             internal ClientState(GrainId id, int gatewaySenderNumber, TimeSpan clientDropTimeout)
             {
@@ -265,16 +264,16 @@ namespace Orleans.Runtime.Messaging
 
             internal void RecordDisconnection()
             {
-                if (Socket == null) return;
+                if (Transport == null) return;
 
                 DisconnectedSince = DateTime.UtcNow;
-                Socket = null;
+                Transport = null;
                 NetworkingStatisticsGroup.OnClosedGatewayDuplexSocket();
             }
 
-            internal void RecordConnection(Socket sock)
+            internal void RecordConnection(ITransport transport)
             {
-                Socket = sock;
+                Transport = transport;
                 DisconnectedSince = DateTime.MaxValue;
             }
 
@@ -443,7 +442,7 @@ namespace Orleans.Runtime.Messaging
                 // If the request includes a message to send, send it (or enqueue it for later)
                 if (msg == null) return;
 
-                if (!Send(msg, clientState.Socket))
+                if (!Send(msg, clientState.Transport))
                 {
                     if (Log.IsVerbose3) Log.Verbose3("Queued message {0} for client {1}", msg, client);
                     clientState.PendingToSend.Enqueue(msg);
@@ -460,7 +459,7 @@ namespace Orleans.Runtime.Messaging
                 while (clientState.PendingToSend.Count > 0)
                 {
                     var m = clientState.PendingToSend.Peek();
-                    if (Send(m, clientState.Socket))
+                    if (Send(m, clientState.Transport))
                     {
                         if (Log.IsVerbose3) Log.Verbose3("Sent queued message {0} to client {1}", m, clientState.Id);
                         clientState.PendingToSend.Dequeue();
@@ -472,11 +471,11 @@ namespace Orleans.Runtime.Messaging
                 }
             }
 
-            private bool Send(Message msg, Socket sock)
+            private bool Send(Message msg, ITransport transport)
             {
                 if (Cts.IsCancellationRequested) return false;
                 
-                if (sock == null) return false;
+                if (transport == null) return false;
                 
                 // Send the message
                 List<ArraySegment<byte>> data;
@@ -506,7 +505,7 @@ namespace Orleans.Runtime.Messaging
                 string sendErrorStr;
                 try
                 {
-                    bytesSent = sock.Send(data);
+                    bytesSent = transport.Send(data);
                     if (bytesSent != length)
                     {
                         // The complete message wasn't sent, even though no error was reported; treat this as an error
@@ -523,19 +522,19 @@ namespace Orleans.Runtime.Messaging
                     {
                         try
                         {
-                            remoteEndpoint = sock.RemoteEndPoint.ToString();
+                            remoteEndpoint = transport.RemoteEndPoint.ToString();
                         }
                         catch (Exception){}
                     }
                     sendErrorStr = String.Format("Exception sending to client at {0}: {1}", remoteEndpoint, exc);
                     Log.Warn(ErrorCode.GatewayExceptionSendingToClient, sendErrorStr, exc);
                 }
-                MessagingStatisticsGroup.OnMessageSend(msg.TargetSilo, msg.Direction, bytesSent, headerLength, SocketDirection.GatewayToClient);
+                MessagingStatisticsGroup.OnMessageSend(msg.TargetSilo, msg.Direction, bytesSent, headerLength, TransportDirection.GatewayToClient);
                 bool sendError = exceptionSending || countMismatchSending;
                 if (sendError)
                 {
-                    gateway.RecordClosedSocket(sock);
-                    SocketManager.CloseSocket(sock);
+                    gateway.RecordClosedTransport(transport);
+                    transport.Close();
                 }
                 gatewaySends.Increment();
                 msg.ReleaseBodyAndHeaderBuffers();

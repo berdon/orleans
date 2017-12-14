@@ -35,6 +35,7 @@ using Orleans.ApplicationParts;
 using Orleans.Runtime.Utilities;
 using System;
 using Orleans.Metadata;
+using Orleans.Messaging;
 
 namespace Orleans.Hosting
 {
@@ -122,6 +123,7 @@ namespace Orleans.Hosting
             services.TryAddSingleton<ISiloPerformanceMetrics>(sp => sp.GetRequiredService<SiloStatisticsManager>().MetricsTable);
             services.TryAddFromExisting<ICorePerformanceMetrics, ISiloPerformanceMetrics>();
             services.TryAddSingleton<GrainTypeManager>();
+            services.TryAddSingleton<ITransportFactory, SocketTransportFactory>();
             services.TryAddSingleton<MessageCenter>();
             services.TryAddFromExisting<IMessageCenter, MessageCenter>();
             services.TryAddFromExisting<ISiloMessageCenter, MessageCenter>();

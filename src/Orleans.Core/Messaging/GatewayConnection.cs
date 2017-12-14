@@ -1,5 +1,4 @@
 using System;
-using System.Net.Sockets;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using Orleans.Runtime;
@@ -35,16 +34,18 @@ namespace Orleans.Messaging
         internal SiloAddress Silo { get; private set; }
 
         private readonly GatewayClientReceiver receiver;
+        private readonly ITransportFactory transportFactory;
         private readonly TimeSpan openConnectionTimeout;
 
-        internal Socket Socket { get; private set; }       // Shared by the receiver
+        internal ITransport Transport { get; private set; }       // Shared by the receiver
 
         private DateTime lastConnect;
 
-        internal GatewayConnection(Uri address, ProxiedMessageCenter mc, MessageFactory messageFactory, ExecutorService executorService, ILoggerFactory loggerFactory, TimeSpan openConnectionTimeout)
+        internal GatewayConnection(Uri address, ProxiedMessageCenter mc, MessageFactory messageFactory, ExecutorService executorService, ILoggerFactory loggerFactory, ITransportFactory transportFactory, TimeSpan openConnectionTimeout)
             : base("GatewayClientSender_" + address, mc.SerializationManager, executorService, loggerFactory)
         {
             this.messageFactory = messageFactory;
+            this.transportFactory = transportFactory;
             this.openConnectionTimeout = openConnectionTimeout;
             Address = address;
             MsgCenter = mc;
@@ -85,15 +86,15 @@ namespace Orleans.Messaging
             receiver.Stop();
             base.Stop();
             MsgCenter.RuntimeClient.BreakOutstandingMessagesToDeadSilo(Silo);
-            Socket s;
+            ITransport transport;
             lock (Lockable)
             {
-                s = Socket;
-                Socket = null;
+                transport = Transport;
+                Transport = null;
             }
-            if (s == null) return;
+            if (transport == null) return;
 
-            CloseSocket(s);
+            CloseTransport(transport);
         }
 
         public void WaitInitialization()
@@ -115,30 +116,30 @@ namespace Orleans.Messaging
         }
 
         // passed the exact same socket on which it got SocketException. This way we prevent races between connect and disconnect.
-        public void MarkAsDisconnected(Socket socket2Disconnect)
+        public void MarkAsDisconnected(ITransport transport2Disconnect)
         {
-            Socket s = null;
+            ITransport transport = null;
             lock (Lockable)
             {
-                if (socket2Disconnect == null || Socket == null) return;
+                if (transport2Disconnect == null || Transport == null) return;
 
-                if (Socket == socket2Disconnect)  // handles races between connect and disconnect, since sometimes we grab the socket outside lock.
+                if (Transport == transport2Disconnect)  // handles races between connect and disconnect, since sometimes we grab the socket outside lock.
                 {
-                    s = Socket;
-                    Socket = null;
+                    transport = Transport;
+                    Transport = null;
                     Log.Warn(ErrorCode.ProxyClient_MarkGatewayDisconnected, String.Format("Marking gateway at address {0} as Disconnected", Address));
                     if (MsgCenter != null && MsgCenter.GatewayManager != null)
                         // We need a refresh...
                         MsgCenter.GatewayManager.ExpediteUpdateLiveGatewaysSnapshot();
                 }
             }
-            if (s != null)
+            if (transport != null)
             {
-                CloseSocket(s);
+                CloseTransport(transport);
             }
-            if (socket2Disconnect == s) return;
+            if (transport2Disconnect == transport) return;
 
-            CloseSocket(socket2Disconnect);
+            CloseTransport(transport2Disconnect);
         }
 
         public void MarkAsDead()
@@ -173,12 +174,12 @@ namespace Orleans.Messaging
                 {
                     try
                     {
-                        if (Socket != null)
+                        if (Transport != null)
                         {
-                            if (Socket.Connected)
+                            if (Transport.Connected)
                                 return;
 
-                            MarkAsDisconnected(Socket); // clean up the socket before reconnecting.
+                            MarkAsDisconnected(Transport); // clean up the socket before reconnecting.
                         }
                         if (lastConnect != new DateTime())
                         {
@@ -198,19 +199,18 @@ namespace Orleans.Messaging
                             }
                         }
                         lastConnect = DateTime.UtcNow;
-                        Socket = new Socket(Silo.Endpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-                        Socket.EnableFastpath();
-                        SocketManager.Connect(Socket, Silo.Endpoint, this.openConnectionTimeout);
+                        Transport = transportFactory.CreateSendingTransport();
+                        Transport.Connect(Silo.Endpoint, this.openConnectionTimeout);
                         NetworkingStatisticsGroup.OnOpenedGatewayDuplexSocket();
                         MsgCenter.OnGatewayConnectionOpen();
-                        SocketManager.WriteConnectionPreamble(Socket, MsgCenter.ClientId);  // Identifies this client
+                        TransportManager.WriteConnectionPreamble(Transport, MsgCenter.ClientId); // Identifies this client
                         Log.Info(ErrorCode.ProxyClient_Connected, "Connected to gateway at address {0} on trial {1}.", Address, i);
                         return;
                     }
                     catch (Exception ex)
                     {
                         Log.Warn(ErrorCode.ProxyClient_CannotConnect, $"Unable to connect to gateway at address {Address} on trial {i} (Exception: {ex.Message})");
-                        MarkAsDisconnected(Socket);
+                        MarkAsDisconnected(Transport);
                     }
                 }
                 // Failed too many times -- give up
@@ -218,7 +218,7 @@ namespace Orleans.Messaging
             }
         }
 
-        protected override SocketDirection GetSocketDirection() { return SocketDirection.ClientToGateway; }
+        protected override TransportDirection GetTransportDirection() { return TransportDirection.ClientToGateway; }
 
         protected override bool PrepareMessageForSend(Message msg)
         {
@@ -245,19 +245,19 @@ namespace Orleans.Messaging
         }
 
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Design", "CA1031:DoNotCatchGeneralExceptionTypes")]
-        protected override bool GetSendingSocket(Message msg, out Socket socketCapture, out SiloAddress targetSilo, out string error)
+        protected override bool GetSendingTransport(Message msg, out ITransport transportCapture, out SiloAddress targetSilo, out string error)
         {
             error = null;
             targetSilo = Silo;
-            socketCapture = null;
+            transportCapture = null;
             try
             {
-                if (Socket == null || !Socket.Connected)
+                if (Transport == null || !Transport.Connected)
                 {
                     Connect();
                 }
-                socketCapture = Socket;
-                if (socketCapture == null || !socketCapture.Connected)
+                transportCapture = Transport;
+                if (transportCapture == null || !transportCapture.Connected)
                 {
                     // Failed to connect -- Connect will have already declared this connection dead, so recycle the message
                     return false;
@@ -271,7 +271,7 @@ namespace Orleans.Messaging
             return true;
         }
 
-        protected override void OnGetSendingSocketFailure(Message msg, string error)
+        protected override void OnGetSendingTransportFailure(Message msg, string error)
         {
             msg.TargetSilo = null; // clear previous destination!
             MsgCenter.SendMessage(msg);
@@ -305,9 +305,9 @@ namespace Orleans.Messaging
             }
         }
 
-        protected override void OnSendFailure(Socket socket, SiloAddress targetSilo)
+        protected override void OnSendFailure(ITransport transport, SiloAddress targetSilo)
         {
-            MarkAsDisconnected(socket);
+            MarkAsDisconnected(transport);
         }
 
         protected override void ProcessMessageAfterSend(Message msg, bool sendError, string sendErrorStr)
@@ -345,9 +345,9 @@ namespace Orleans.Messaging
             MsgCenter.SendMessage(msg);
         }
 
-        private void CloseSocket(Socket socket)
+        private void CloseTransport(ITransport transport)
         {
-            SocketManager.CloseSocket(socket);
+            transport.Close();
             NetworkingStatisticsGroup.OnClosedGatewayDuplexSocket();
             MsgCenter.OnGatewayConnectionClosed();
         }

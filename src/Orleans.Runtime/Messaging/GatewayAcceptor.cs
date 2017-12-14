@@ -1,5 +1,4 @@
 using System.Net;
-using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Orleans.Hosting;
@@ -25,8 +24,9 @@ namespace Orleans.Runtime.Messaging
             ExecutorService executorService,
             IOptions<SiloOptions> siloOptions,
             IOptions<MultiClusterOptions> multiClusterOptions,
-            ILoggerFactory loggerFactory)
-            : base(msgCtr, gatewayAddress, SocketDirection.GatewayToClient, messageFactory, serializationManager, executorService, loggerFactory)
+            ILoggerFactory loggerFactory,
+            ITransportFactory transportFactory)
+            : base(msgCtr, gatewayAddress, messageFactory, serializationManager, executorService, loggerFactory, transportFactory)
         {
             this.gateway = gateway;
             this.loadSheddingCounter = CounterStatistic.FindOrCreate(StatisticNames.GATEWAY_LOAD_SHEDDING);
@@ -35,11 +35,11 @@ namespace Orleans.Runtime.Messaging
             this.multiClusterOptions = multiClusterOptions.Value;
         }
 
-        protected override bool RecordOpenedSocket(Socket sock)
+        protected override bool RecordOpenedTransport(ITransport transport)
         {
             ThreadTrackingStatistic.FirstClientConnectedStartTracking();
             GrainId client;
-            if (!ReceiveSocketPreample(sock, true, out client)) return false;
+            if (!ReceiveTransportPreample(transport, true, out client)) return false;
 
             // refuse clients that are connecting to the wrong cluster
             if (client.Category == UniqueKey.Category.GeoClient)
@@ -62,15 +62,15 @@ namespace Orleans.Runtime.Messaging
                 }
             }
 
-            gateway.RecordOpenedSocket(sock, client);
+            gateway.RecordOpenedTransport(transport, client);
             return true;
         }
   
         // Always called under a lock
-        protected override void RecordClosedSocket(Socket sock)
+        protected override void RecordClosedTransport(ITransport transport)
         {
-            TryRemoveClosedSocket(sock); // don't count this closed socket in IMA, we count it in Gateway.
-            gateway.RecordClosedSocket(sock);
+            TryRemoveClosedTransport(transport); // don't count this closed socket in IMA, we count it in Gateway.
+            gateway.RecordClosedTransport(transport);
         }
 
 
@@ -80,7 +80,7 @@ namespace Orleans.Runtime.Messaging
         /// </summary>
         /// <param name="msg"></param>
         /// <param name="receivedOnSocket"></param>
-        protected override void HandleMessage(Message msg, Socket receivedOnSocket)
+        public override void HandleMessage(Message msg)
         {
             // Don't process messages that have already timed out
             if (msg.IsExpired)
